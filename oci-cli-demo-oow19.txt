@@ -1,0 +1,235 @@
+#########################################
+# Nelson Calero                         #
+# OOW19 session DEV1798                 #
+# Examples of OCI CLI commands          #
+#########################################
+
+
+############################################################
+#### 1. Install oci command line utility (CLI) in linux ####
+############################################################
+
+bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci- cli/master/scripts/install/install.sh)"
+
+
+##############################################
+#### 2. Configure your account in the CLI ####
+##############################################
+
+openssl genrsa -out OCI_api_key.pem 2048
+chmod go-rwx OCI_api_key.pem
+openssl rsa -pubout -in OCI_api_key.pem -out OCI_api_key-pub.pem
+
+# upload OCI_api_key-pub.pem using cloud web console to one user in your account
+
+# take not of the fingerprint reported, is needed to configure cli below
+
+# setup the CLI providing that same information: user, private key, public key fingerprint
+oci setup config
+
+# check all is as expected
+cat ~/.oci/config
+
+
+##################################
+#### 3. Miscelaneous commands ####
+##################################
+
+# available cloud regions
+oci iam region list --output table
+
+# compartements created in our account
+oci iam compartment list --output table --query "data [*].{name:name,id:id}"
+
+# save the compartment we want to use (named "nelson") into variable COMPID 
+export COMPID=$(oci iam compartment list --all --query "data [?contains(\"name\",'nelson')].{id:id}" | jq -r '.[]."id"')
+echo $COMPID
+
+# ADs available
+oci iam availability-domain list -c $COMPID --query "data [*].{name:name,id:id}" --all --output table 
+
+# Fault domains
+oci iam fault-domain list -c $COMPID --availability-domain DMXj:US-ASHBURN-AD-1
+
+
+#### DBs
+
+# database versions we can use
+oci db version list -c $COMPID
+
+# same including PSU levels for a particular image
+oci db version list -c $COMPID --db-system-shape "VM.Standard1.1" --all --output table
+
+# databases created in our compartment
+oci db system list -c $COMPID 
+
+# clearer output of above
+oci db system list -c $COMPID --query 'data [*].{AD:"availability-domain", Name:"display-name", shape:"shape", lifecyclestate:"lifecycle-state", nodecount:"node-count"}' --output table
+
+# to see databases created in all compartments
+for i in `oci iam compartment list --all --query 'data [*].{id:id}' | jq -r '.[]."id"'` ; do echo "DBs in compartment $i:" ; oci db system list -c $i --query 'data [*].{ClusterName:"cluster-name", shape:shape}' --output table ; done
+
+
+#### compute instances
+
+oci compute instance list -c $COMPID --query 'data [*].{AD:"availability-domain", Name:"display-name", shape:"shape", region:region}' --output table 
+
+
+#### network
+
+# VCNs in our account
+oci network vcn list -c $COMPID --output table
+
+# save VCN id into variable VCNID
+# NOTE: if you have several VCNs, need to filter to find one (see subnet example below)
+export VCNID=$(oci network vcn list -c $COMPID | jq -r '.data[]."id"')
+
+echo $VCNID
+
+# all subnets from VCN
+oci network subnet list -c $COMPID --vcn-id $VCNID --output table --query 'data [*].{Name:"display-name", AD:"availability-domain", CIDR:"cidr-block", id:id}'
+
+# example filtering by subnet name including the string ASHB (case sensitive)
+oci network subnet list -c $COMPID --vcn-id $VCNID --output table --query "data [?contains(\"display-name\",'ASHB')].{Name:\"display-name\", AD:\"availability-domain\", CIDR:\"cidr-block\"}"
+
+# save subnet id of US-ASHBURN-AD-1 into variable SUBNETID
+export SUBNETID=$(oci network subnet list -c $COMPID --vcn-id $VCNID --query "data [?contains(\"display-name\",'US-ASHBURN-AD-1')].{id:id}" | jq -r '.[]."id"')
+
+echo $SUBNETID
+
+# security lists of one subnet
+oci network subnet get --subnet-id $SUBNETID --query 'data.{"subnet-domain-name":"subnet-domain-name", "security-list-ids":"security-list-ids"}'
+
+# save the first security list id into variable SECLISTID
+export SECLISTID=$(oci network subnet get --subnet-id $SUBNETID --query 'data' | jq -r '."security-list-ids"[0]')
+echo $SECLISTID
+
+# rules inside that scurity list
+oci network security-list get --security-list-id $SECLISTID
+
+
+################################
+#### 4. Creating a database ####
+################################
+
+# generate a sample JSON file with all parameters required
+oci db system launch --generate-full-command-json-input
+
+# prepare a JSON file with the values you want for the parameters from previous output
+vi crea-db-19.3.json
+cat crea-db-19.3.json
+
+# relevant parameters used in this example:
+#  "waitForState": "PROVISIONING",
+#  "dbName": "CTEST",
+#  "dbVersion": "19.3.0.0",
+#  "licenseModel": "BRING_YOUR_OWN_LICENSE",
+#  "nodeCount": 1,
+#  "shape": "VM.Standard1.1",
+  
+# create the DB
+oci db system launch --from-json file://crea-db-19.3.json
+
+# save system ID shown in previous command output into variable DBSYSID 
+export DBSYSID=<your-sys-id>
+
+# while database is being created, version is reported as null
+oci db system get --db-system-id $DBSYSID | grep version
+
+# once DB is created we can see its node IP address stored in the VNIC
+oci db node list -c $COMPID --db-system-id $DBSYSID --output table --query 'data [*].{hostname:hostname, "vnic-id":"vnic-id"}'
+
+# save the first nic id into variable VNICID
+export VNICID=$(oci db node list -c $COMPID --db-system-id $DBSYSID --query 'data' | jq -r '.[0]."vnic-id"')
+echo $VNICID
+
+# view IP address assigned to the database node
+oci network vnic get --vnic-id $VNICID --output table --query 'data.{"hostname-label":"hostname-label", "private-ip":"private-ip", "public-ip":"public-ip"}'
+
+# save the public IP into variable NODEIP
+export NODEIP=$(oci network vnic get --vnic-id $VNICID | jq -r '.data."public-ip"')
+echo $NODEIP
+
+# connect to instance using the IP returned in the previous command
+ssh -i ~/ioug/ssh-key.priv opc@$NODEIP
+
+
+#########################################
+#### 5. Validations in the DB server ####
+#########################################
+
+ps -eaf | grep pmon
+tail /etc/oratab
+cat /etc/oracle-release
+
+sudo su - grid
+crsctl query crs activeversion
+crsctl get cluster configuration
+exit
+
+sudo su -
+dbcli describe-component
+dbcli list-dbhomes
+
+
+#### logs
+
+ls -lrt /opt/oracle/dcs/log/
+
+
+#### backups
+
+dbcli getstatus-backup -h
+dbcli getstatus-backup -in CTEST -t Archivelog
+
+dbcli create-rmanbackupreport -w summary -rn test --dbname CTEST
+dbcli list-jobs
+
+# use jobId from previous command to see a detailed report
+export JOBID=$(dbcli list-jobs --tail 1 | tail -n +4 | cut -d" " -f1)
+echo $JOBID
+dbcli describe-job -i $JOBID
+
+ls -lrt /opt/oracle/dcs/log/ | tail
+ 
+
+#### patching 
+
+# check prereqs
+dbcli update-server -p
+dbcli list-jobs 
+
+# after it completes, check details:
+export JOBID=$(dbcli list-jobs --tail 1 | tail -n +4 | cut -d" " -f1)
+echo $JOBID
+dbcli describe-job -i $JOBID
+
+# details?
+less /tmp/opatchAutoAnalyzePatch.log
+
+
+#### misc DB settings
+
+dbcli list-logSpaceUsage
+
+dbcli list-autoLogCleanPolicy
+dbcli create-autoLogCleanPolicy 
+
+# use home ID from dbcli list-dbhomes
+export HOMEID=$(dbcli list-dbhomes | tail -n +4 | cut -d" " -f1)
+echo $HOMEID
+
+dbcli describe-netsecurity -H $HOMEID
+cat /u01/app/oracle/product/19.0.0.0/dbhome_1/network/admin/sqlnet.ora
+
+dbcli update-netsecurity -h
+
+
+#########################
+#### 6. Terminate DB ####
+#########################
+
+# once you are finished with your tests, remember to destroy your instance to avoid charges
+
+oci db system terminate --db-system-id $DBSYSID
+
